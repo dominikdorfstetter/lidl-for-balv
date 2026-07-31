@@ -123,6 +123,9 @@ const HIGH_CPU_DURATION = 30000; // 30 Sekunden
 let nanErrorCount = 0;
 const MAX_NAN_ERRORS = 3;
 
+// Benachrichtigung "Tarif inaktiv" nur einmal senden, bis der Tarif wieder aktiv ist
+let tarifInactiveNotified = false;
+
 // Circuit Breaker Pattern
 class CircuitBreaker {
     constructor(threshold = 5, timeout = 60000) {
@@ -345,24 +348,20 @@ async function killExistingPlaywright() {
                 }
             }
         } else if (isLinux || isMac) {
-            // Auf Linux/macOS: pgrep zum Zählen, dann pkill zum Killen
-            const browserProcesses = ['chrome', 'firefox', 'chromium', 'chromium-browser', 'google-chrome'];
-            
-            for (const processName of browserProcesses) {
-                try {
-                    // Zähle wie viele Prozesse gefunden wurden
-                    const output = execSync(`pgrep -f ${processName} 2>/dev/null || true`, { encoding: 'utf-8' });
-                    const count = output.trim().split('\n').filter(line => line.length > 0).length;
-                    
-                    if (count > 0) {
-                        // Killen
-                        execSync(`pkill -f ${processName} 2>/dev/null || true`, { stdio: 'pipe' });
-                        processesKilled += count;
-                        logger.info(`${count} ${processName}-Prozess(e) beendet`);
-                    }
-                } catch (err) {
-                    // Prozess nicht gefunden ist ok
+            // Auf Linux/macOS: nur von Playwright installierte Browser killen
+            // (Installationspfad enthält "ms-playwright") - normale Browser des
+            // Benutzers (Chrome/Firefox) bleiben unberührt
+            try {
+                const output = execSync(`pgrep -f ms-playwright 2>/dev/null || true`, { encoding: 'utf-8' });
+                const count = output.trim().split('\n').filter(line => line.length > 0).length;
+
+                if (count > 0) {
+                    execSync(`pkill -f ms-playwright 2>/dev/null || true`, { stdio: 'pipe' });
+                    processesKilled += count;
+                    logger.info(`${count} Playwright-Browser-Prozess(e) beendet`);
                 }
+            } catch (err) {
+                // Prozess nicht gefunden ist ok
             }
         }
 
@@ -501,6 +500,13 @@ async function validateSession() {
 async function keepSessionAlive() {
     if (!page || page.isClosed() || isShuttingDown) return;
 
+    // Nur eingeloggte Sessions am Leben halten - ein Reload während des Logins
+    // bricht sonst das Warten auf die Login-Antwort ab
+    if (!page.url().startsWith(uebersichtUrl)) {
+        logger.debug("Keep-Alive übersprungen (nicht auf Übersichtsseite)");
+        return;
+    }
+
     try {
         const keepAlivePromise = (async () => {
             await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
@@ -632,15 +638,15 @@ async function initializeBrowser() {
         logger.info("Browser erfolgreich gestartet");
         page = await context.newPage();
 
-        // Setze Viewport und Device-Properties basierend auf generierter Fingerprint
-        const fingerprint2 = generateFingerprint();
-        await page.setViewportSize(fingerprint2.viewport);
+        // Viewport und Device-Properties passend zum geloggten Fingerprint setzen
+        // (vorher wurde hier ein zweiter, abweichender Fingerprint generiert)
+        await page.setViewportSize(fingerprint.viewport);
         await page.addInitScript(`
             Object.defineProperty(navigator, 'deviceMemory', {
-                get: () => ${fingerprint2.deviceMemory}
+                get: () => ${fingerprint.deviceMemory}
             });
             Object.defineProperty(navigator, 'hardwareConcurrency', {
-                get: () => ${fingerprint2.hardwareConcurrency}
+                get: () => ${fingerprint.hardwareConcurrency}
             });
         `);
 
@@ -704,13 +710,35 @@ async function performLogin() {
 
             logger.info("Login-Daten eingegeben, sende Formular...");
 
-            // Login-Button klicken und auf Navigation warten
-            await Promise.all([
-                page.click('button[type="submit"]:has-text("Einloggen")'),
-                page.waitForNavigation({ waitUntil: "networkidle", timeout: 30000 })
+            // Der Login ist ein AJAX-Call (POST /api/token) ohne Seiten-Navigation:
+            // die API-Antwort direkt auswerten statt auf eine Navigation zu warten
+            const [tokenResponse] = await Promise.all([
+                page.waitForResponse(resp =>
+                    resp.url().includes("/api/token") && resp.request().method() === "POST",
+                    { timeout: 30000 }
+                ),
+                page.click('button[type="submit"]:has-text("Einloggen")')
             ]);
 
-            await delay(3000);
+            if (tokenResponse.status() === 401) {
+                // API-Antwort mitloggen: unterscheidet falsches Passwort von gesperrtem Account
+                let detail = "";
+                try { detail = (await tokenResponse.text()).slice(0, 300); } catch { }
+                const err = new Error(`Zugangsdaten abgelehnt (401) - RUFNUMMER/PASSWORD in .env prüfen! Achtung: Nach 3 Falscheingaben sperrt Lidl Connect den Account. API-Antwort: ${detail}`);
+                err.isAuthRejection = true;
+                throw err;
+            }
+            if (!tokenResponse.ok()) {
+                throw new Error(`Login-API antwortete mit Status ${tokenResponse.status()}`);
+            }
+
+            // Nach erfolgreichem Login leitet die Seite zur Übersicht weiter
+            try {
+                await page.waitForURL(url => url.href.startsWith(uebersichtUrl), { timeout: 15000 });
+            } catch {
+                await page.goto(uebersichtUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
+            }
+            await delay(2000);
             const currentUrl = page.url();
             if (!currentUrl.startsWith(uebersichtUrl)) {
                 throw new Error(`Login fehlgeschlagen, unerwartete URL: ${currentUrl}`);
@@ -723,7 +751,7 @@ async function performLogin() {
             loginAttempts = 0;
             consecutiveErrors = 0;
 
-            logger.info("Login erfolgreich, Session-Daten gespeichert");
+            logger.info("✅ Drin! Wolf ist eingeloggt, Session ist gebunkert");
             return true;
         })();
 
@@ -737,6 +765,11 @@ async function performLogin() {
     } catch (error) {
         logger.error(`Login fehlgeschlagen: ${error.message}`);
         consecutiveErrors++;
+
+        // Abgelehnte Zugangsdaten: NICHT erneut versuchen (Account-Sperrung nach 3 Falscheingaben)
+        if (error.isAuthRejection) {
+            throw error;
+        }
 
         // Bei wiederholten Fehlern längere Pause
         if (loginAttempts >= 2) {
@@ -765,7 +798,7 @@ async function main() {
             }
 
             // Login durchführen (Browser-Daten wurden bereits gelöscht bei initializeBrowser)
-            logger.info("Führe Login durch...");
+            logger.info("Roll dir schon mal einen, Wolf - ich logg dich derweil ein...");
             const loginSuccess = await performLogin();
             if (!loginSuccess) {
                 throw new Error("Login nach mehreren Versuchen fehlgeschlagen");
@@ -777,56 +810,95 @@ async function main() {
                 await delay(2000);
             }
 
-            // Warte auf Datenvolumen-Element bevor wir extrahieren
+            // Die Verbrauchsanzeige ist eine Webcomponent (app-consumptions-v2), die asynchron lädt:
+            // warte auf Datenvolumen ODER den Hinweis "keine Inklusiv-Einheiten" (Tarif nicht aktiv)
+            let consumptionState = 'unknown';
             try {
-                await page.waitForFunction(() => {
-                    const element = document.querySelector('label[for="DATA"].unit-display');
-                    return element && element.textContent.trim().length > 0;
-                }, { timeout: 15000 });
-                logger.debug("Datenvolumen-Element gefunden und bereit");
+                const handle = await page.waitForFunction(() => {
+                    // altes Portal: for="DATA"; neues Portal: for="progress-DATA-0" etc.
+                    const dataLabel = document.querySelector('label.unit-display');
+                    if (dataLabel && dataLabel.textContent.trim().length > 0) return 'data';
+                    if (document.querySelector('.app-consumptions .txt-no-booked-tariff')) return 'inactive';
+                    return false;
+                }, { timeout: 20000 });
+                consumptionState = await handle.jsonValue();
+
+                // Der "keine Inklusiv-Einheiten"-Hinweis ist zugleich der Lade-Platzhalter
+                // der Webcomponent: erst akzeptieren, wenn binnen Nachfrist keine Daten kommen
+                if (consumptionState === 'inactive') {
+                    try {
+                        await page.waitForFunction(() => {
+                            const dataLabel = document.querySelector('label.unit-display');
+                            return dataLabel && dataLabel.textContent.trim().length > 0;
+                        }, { timeout: 15000 });
+                        consumptionState = 'data';
+                    } catch {
+                        // Hinweis blieb bestehen -> Tarif wirklich inaktiv
+                    }
+                }
+                logger.debug(`Verbrauchsanzeige geladen, Zustand: ${consumptionState}`);
             } catch (error) {
-                logger.warn(`Datenvolumen-Element nicht gefunden: ${error.message}`);
+                logger.warn(`Verbrauchsanzeige nicht gefunden: ${error.message}`);
             }
+
+            if (consumptionState === 'inactive') {
+                const guthaben = await page.evaluate(() =>
+                    document.querySelector('.app-balance-info-formatted-balance')?.textContent.trim()
+                    ?? document.querySelector('.app-balance-info')?.textContent.replace(/\s+/g, ' ').trim()
+                    ?? 'unbekannt'
+                );
+                logger.warn(`🚨 Wolf, dein Tarif ist gerade NICHT aktiv - keine Inklusiv-Einheiten vorhanden. Guthaben: ${guthaben}`);
+                if (!tarifInactiveNotified) {
+                    sendMessage(`🚨 Wolf, dein Tarif ist nicht aktiv - keine Inklusiv-Einheiten! Vermutlich reicht dein Guthaben (${guthaben}) nicht für die Tarif-Verlängerung. Lad was auf, sonst kann ich dir nix nachlegen! 🌿`, "warn");
+                    tarifInactiveNotified = true;
+                }
+                resetNanErrors(); // bekannter Zustand, kein Auslesefehler
+                lastActivityTime = Date.now();
+                saveSessionMeta();
+                updateHeartbeat();
+                return 0;
+            }
+            tarifInactiveNotified = false;
 
             await delay(1000); // Zusätzliche kurze Wartezeit
 
 			// Datenvolumen auslesen (Tarif + Refill)
+			// Unterstützt altes Portal (for="DATA" / for="REFILLABLE_DATA") und neues
+			// Portal (for="progress-DATA-0" / for="progress-refill-REFILLABLE_DATA-0");
+			// "Unbegrenzt" wird bei Unlimited-Tarifen statt Zahlen angezeigt
 			const usage = await page.evaluate(() => {
-				const result = {
-					tarif: { available: NaN, total: NaN, unit: '' },
-					refill: { available: NaN, total: NaN, unit: '' }
+				const parseLabel = (label) => {
+					const out = { available: NaN, total: NaN, unit: '', unlimited: false };
+					if (!label) return out;
+					const text = label.textContent.trim();
+					if (/unbegrenzt/i.test(text)) {
+						out.unlimited = true;
+						return out;
+					}
+					const nums = text.match(/(\d+(?:[.,]\d+)?)/g) || [];
+					out.available = nums[0] ? parseFloat(nums[0].replace(',', '.')) : NaN;
+					out.total = nums[1] ? parseFloat(nums[1].replace(',', '.')) : NaN;
+					const unitEl = label.querySelector('span.unit');
+					out.unit = unitEl ? unitEl.textContent.trim() : ((text.match(/GB|MB/) || [''])[0]);
+					return out;
 				};
 
-				// Get Tarif data (DATA id)
-				const tarifLabel = document.querySelector('label[for="DATA"].unit-display');
-				if (tarifLabel) {
-					const text = tarifLabel.textContent.trim();
-					const nums = text.match(/(\d+(?:[.,]\d+)?)/g) || [];
-					result.tarif.available = nums[0] ? parseFloat(nums[0].replace(',', '.')) : NaN;
-					result.tarif.total = nums[1] ? parseFloat(nums[1].replace(',', '.')) : NaN;
-					const unitEl = tarifLabel.querySelector('span.unit');
-					result.tarif.unit = unitEl ? unitEl.textContent.trim() : '';
-				}
+				const labels = [...document.querySelectorAll('label.unit-display')];
+				const forAttr = l => l.getAttribute('for') || '';
+				// "DATA" als eigenes Segment (nicht DAY_FLAT_DATA), ohne REFILLABLE
+				const tarifLabel = labels.find(l => /(^|-)DATA(-|$)/.test(forAttr(l)) && !forAttr(l).includes('REFILLABLE'));
+				const refillLabel = labels.find(l => forAttr(l).includes('REFILLABLE_DATA'));
 
-				// Get Refill data (REFILLABLE_DATA id) - optional, may not always be present
-				const refillLabel = document.querySelector('label[for="REFILLABLE_DATA"].unit-display');
-				if (refillLabel) {
-					const text = refillLabel.textContent.trim();
-					const nums = text.match(/(\d+(?:[.,]\d+)?)/g) || [];
-					result.refill.available = nums[0] ? parseFloat(nums[0].replace(',', '.')) : NaN;
-					result.refill.total = nums[1] ? parseFloat(nums[1].replace(',', '.')) : NaN;
-					const unitEl = refillLabel.querySelector('span.unit');
-					result.refill.unit = unitEl ? unitEl.textContent.trim() : '';
-				}
-
-				return result;
+				return { tarif: parseLabel(tarifLabel), refill: parseLabel(refillLabel) };
 			});
-			
+
 			let datenVerfuegbar = usage.tarif.available;
 			let refillVerfuegbar = usage.refill.available;
+			const tarifUnbegrenzt = usage.tarif.unlimited;
 
-			// NaN-Fehlerbehandlung: Wenn Datenvolumen nicht lesbar ist
-			if (isNaN(datenVerfuegbar)) {
+			// NaN-Fehlerbehandlung: Wenn gar kein Datenvolumen lesbar ist
+			// (bei Unlimited-Tarifen zählt nur das Refill-Volumen)
+			if (isNaN(datenVerfuegbar) && !tarifUnbegrenzt && isNaN(refillVerfuegbar)) {
 				logger.warn(`Datenvolumen ist NaN - Fehler ${nanErrorCount + 1}/${MAX_NAN_ERRORS}`);
 				nanErrorCount++;
 				
@@ -848,59 +920,77 @@ async function main() {
 			resetNanErrors();
 
 			// Log both volumes
-			const tarifMessage = `📊 Tarif: ${usage.tarif.available} ${usage.tarif.unit} / ${usage.tarif.total} ${usage.tarif.unit}`;
+			const tarifAnzeige = tarifUnbegrenzt
+				? 'Unbegrenzt'
+				: `${usage.tarif.available} ${usage.tarif.unit} / ${usage.tarif.total} ${usage.tarif.unit}`;
+			const tarifMessage = `🌿 Tarif-Stash: ${tarifAnzeige}`;
 			let refillMessage = '';
-			
+
 			// Only log refill if it's available (has valid numbers)
 			if (!isNaN(refillVerfuegbar)) {
-				refillMessage = `📊 Refill: ${usage.refill.available} ${usage.refill.unit} / ${usage.refill.total} ${usage.refill.unit}`;
+				refillMessage = `🌿 Refill-Stash: ${usage.refill.available} ${usage.refill.unit} / ${usage.refill.total} ${usage.refill.unit}`;
 				logger.info(refillMessage);
 			}
 			
 			logger.info(tarifMessage);
 
-            // Nachbuchung falls nötig (unter 0.8 GB vom Refill Volumen)
+            // Nachbuchung falls nötig (unter 0.8 GB vom Refill-Volumen).
+            // Bei Unlimited-Tarifen (oder unlesbarem Tarifwert) zählt nur das Refill-Volumen.
             let nachbuchungsErfolg = false;
-            if (!isNaN(datenVerfuegbar) && datenVerfuegbar < 1 && (!isNaN(refillVerfuegbar) && refillVerfuegbar < 0.8)) {
+            const tarifNiedrig = tarifUnbegrenzt || isNaN(datenVerfuegbar) || datenVerfuegbar < 1;
+            if (tarifNiedrig && !isNaN(refillVerfuegbar) && refillVerfuegbar < 0.8) {
                 try {
-                    logger.info("Wenig Datenvolumen, versuche Refill zu aktivieren...");
+                    logger.info("🚨 Wolf, dein Stash geht zur Neige - ich leg dir was nach (Refill wird aktiviert)...");
                     const refillVorher = refillVerfuegbar;
                     
                     await page.click('button:has-text("Refill aktivieren")', { timeout: 10000 });
-                    await delay(7000);
-                    
-                    // Seite neu laden und Refill-Volumen neu prüfen
-                    await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
-                    await delay(2000);
-                    
-                    const usageNach = await page.evaluate(() => {
-                        const result = { available: NaN, total: NaN, unit: '' };
-                        const refillLabel = document.querySelector('label[for="REFILLABLE_DATA"].unit-display');
-                        if (refillLabel) {
-                            const text = refillLabel.textContent.trim();
-                            const nums = text.match(/(\d+(?:[.,]\d+)?)/g) || [];
-                            result.available = nums[0] ? parseFloat(nums[0].replace(',', '.')) : NaN;
-                            result.total = nums[1] ? parseFloat(nums[1].replace(',', '.')) : NaN;
-                            const unitEl = refillLabel.querySelector('span.unit');
-                            result.unit = unitEl ? unitEl.textContent.trim() : '';
-                        }
-                        return result;
-                    });
-                    
-                    const refillNachher = usageNach.available;
+
+                    // Die Buchung wird asynchron verarbeitet und die Anzeige lädt nach dem
+                    // Reload verzögert (Webcomponent): bis zu 3 Versuche mit Wartezeit
+                    let refillNachher = NaN;
+                    for (let versuch = 1; versuch <= 3; versuch++) {
+                        await delay(versuch === 1 ? 8000 : 12000);
+                        await page.reload({ waitUntil: "domcontentloaded", timeout: 15000 });
+                        try {
+                            await page.waitForFunction(() => {
+                                const l = [...document.querySelectorAll('label.unit-display')]
+                                    .find(el => (el.getAttribute('for') || '').includes('REFILLABLE_DATA'));
+                                return l && l.textContent.trim().length > 0;
+                            }, { timeout: 20000 });
+                        } catch { }
+
+                        const usageNach = await page.evaluate(() => {
+                            const result = { available: NaN, total: NaN, unit: '' };
+                            const refillLabel = [...document.querySelectorAll('label.unit-display')]
+                                .find(l => (l.getAttribute('for') || '').includes('REFILLABLE_DATA'));
+                            if (refillLabel) {
+                                const text = refillLabel.textContent.trim();
+                                const nums = text.match(/(\d+(?:[.,]\d+)?)/g) || [];
+                                result.available = nums[0] ? parseFloat(nums[0].replace(',', '.')) : NaN;
+                                result.total = nums[1] ? parseFloat(nums[1].replace(',', '.')) : NaN;
+                                const unitEl = refillLabel.querySelector('span.unit');
+                                result.unit = unitEl ? unitEl.textContent.trim() : '';
+                            }
+                            return result;
+                        });
+
+                        refillNachher = usageNach.available;
+                        if (!isNaN(refillNachher) && refillNachher > refillVorher) break;
+                        logger.info(`Refill-Anzeige noch bei ${refillNachher} GB (Versuch ${versuch}/3), Buchung braucht evtl. einen Moment...`);
+                    }
                     
                     // Prüfe ob Refill sich erhöht hat
                     if (!isNaN(refillNachher) && refillNachher > refillVorher) {
                         nachbuchungsErfolg = true;
-                        logger.info(`✅ Refill erfolgreich aktiviert: ${refillVorher}GB → ${refillNachher}GB`);
+                        logger.info(`✅ Frisch nachgelegt, Wolf! Refill: ${refillVorher}GB → ${refillNachher}GB`);
                         
                         // Aktualisiere refillVerfuegbar mit neuem Wert für korrekte Berechnung
                         refillVerfuegbar = refillNachher;
                         
                         // Erfolgs-Nachricht sofort senden
-                        let successMessage = `✅ Refill erfolgreich aktiviert!\n`;
-                        successMessage += `📊 Tarif: ${datenVerfuegbar} GB / 25 GB\n`;
-                        successMessage += `📊 Refill: ${refillVorher}GB → ${refillNachher}GB`;
+                        let successMessage = `✅ Frisch nachgelegt, Wolf - Refill ist durch! 🌿\n`;
+                        successMessage += `${tarifMessage}\n`;
+                        successMessage += `🌿 Refill-Stash: ${refillVorher}GB → ${refillNachher}GB`;
                         sendMessage(successMessage, "info");
                     } else {
                         logger.warn(`Refill-Aktivierung möglicherweise fehlgeschlagen: ${refillVorher}GB → ${refillNachher}GB`);
@@ -912,7 +1002,9 @@ async function main() {
             }
 
             // Gesamtes verfügbares Datenvolumen = Tarif + Refill
-            datenVolumen = datenVerfuegbar + refillVerfuegbar;
+            // (bei Unlimited-Tarif oder unlesbarem Tarifwert zählt nur das Refill-Volumen)
+            const tarifAnteil = (!tarifUnbegrenzt && !isNaN(datenVerfuegbar)) ? datenVerfuegbar : 0;
+            datenVolumen = tarifAnteil + (isNaN(refillVerfuegbar) ? 0 : refillVerfuegbar);
             lastActivityTime = Date.now();
             saveSessionMeta();
             updateHeartbeat(); // Watchdog-Signal
@@ -921,7 +1013,7 @@ async function main() {
                 if (!nachbuchungsErfolg) {
                     let finalStatusMessage = tarifMessage;
                     if (!isNaN(refillVerfuegbar)) {
-                        finalStatusMessage += `\n📊 Refill: ${refillVerfuegbar} ${usage.refill.unit} / ${usage.refill.total} ${usage.refill.unit}`;
+                        finalStatusMessage += `\n🌿 Refill-Stash: ${refillVerfuegbar} ${usage.refill.unit} / ${usage.refill.total} ${usage.refill.unit}`;
                     }
                     sendMessage(finalStatusMessage, "info");
                 }
@@ -930,6 +1022,13 @@ async function main() {
         });
 
     } catch (error) {
+        if (error.isAuthRejection) {
+            logger.error(`🛑 ${error.message}`);
+            sendMessage(`🛑 Wolf, der Login wurde abgelehnt - ich beende das Script, damit dein Account nicht gesperrt wird. Check die Zugangsdaten in der .env!`, "error");
+            await gracefulShutdown('AUTH_REJECTED');
+            return 0;
+        }
+
         sendMessage(`🚨 Fehler aufgetreten: ${error.message}`, "error");
         logger.error(`Fehler in main(): ${error.message}`);
         consecutiveErrors++;
@@ -944,12 +1043,23 @@ async function main() {
     }
 }
 
-// Update-Funktion (unverändert)
+// Semantischer Versionsvergleich ("1.10.0" > "1.9.0", was ein Stringvergleich falsch macht)
+function isNewerVersion(latest, current) {
+    const a = String(latest).split('.').map(Number);
+    const b = String(current).split('.').map(Number);
+    for (let i = 0; i < Math.max(a.length, b.length); i++) {
+        const diff = (a[i] || 0) - (b[i] || 0);
+        if (diff !== 0) return diff > 0;
+    }
+    return false;
+}
+
+// Update-Funktion
 async function checkForUpdates() {
     try {
         const response = await axios.get(updateUrl);
         const latestVersion = response.data.version;
-        if (latestVersion > version) {
+        if (isNewerVersion(latestVersion, version)) {
             logger.warn(`New version available: ${latestVersion}. Updating the script...`);
             if (autoUpdate) {
                 const scriptPath = 'script.js';
@@ -1130,7 +1240,7 @@ function stopTimers() {
 
 // Verbesserte Hauptschleife mit besserer Fehlerbehandlung
 async function start() {
-    logger.info("🚀 Starting lidl-extender script v" + version);
+    logger.info("🌿 High, Wolf! Dein Daten-Dealer v" + version + " ist am Start");
 
     // Killen von existierenden Playwright-Prozessen beim Start (nur wenn aktiviert)
     if (killExistingProcesses) {
@@ -1201,11 +1311,11 @@ async function start() {
             }
 
             if (datenVolumen !== 0) {
-                logger.info(`📊 Verfügbares Datenvolumen: ${datenVolumen} GB`);
-                logger.info(`⏰ Nächste Prüfung in ${nextInterval} Sekunden`);
-                sendMessage(`📊 ${datenVolumen} GB verfügbar. Nächste Prüfung in ${nextInterval} Sekunden.`, "info");
+                logger.info(`🌿 Wolf, du hast noch ${datenVolumen} GB im Beutel`);
+                logger.info(`⏰ Chillphase: in ${nextInterval} Sekunden check ich deinen Stash wieder`);
+                sendMessage(`🌿 Wolf, noch ${datenVolumen} GB im Beutel. Ich chill jetzt ${nextInterval} Sekunden, dann check ich wieder. ✌️`, "info");
             } else {
-                logger.warn("⚠️ Datenvolumen ist 0 oder Fehler aufgetreten");
+                logger.warn("⚠️ Beutel leer (0 GB) oder irgendwas ist schiefgelaufen, Wolf");
             }
 
             // Timeout für nächsten Lauf setzen
@@ -1230,7 +1340,7 @@ async function gracefulShutdown(signal) {
     if (isShuttingDown) return;
 
     logger.info(`🛑 Received ${signal}. Shutting down gracefully...`);
-    sendMessage("🛑 Lidl-Extender wird beendet...", "info");
+    sendMessage("🛑 Wolf, ich mach Feierabend - bleib entspannt ✌️", "info");
 
     isShuttingDown = true;
 
@@ -1245,7 +1355,7 @@ async function gracefulShutdown(signal) {
         await delay(2000);
 
         logger.info("✅ Graceful shutdown completed");
-        sendMessage("✅ Lidl-Extender sicher beendet", "info");
+        sendMessage("✅ Sauber runtergefahren. Peace, Wolf ✌️🌿", "info");
 
     } catch (error) {
         logger.error(`Fehler beim Shutdown: ${error.message}`);
