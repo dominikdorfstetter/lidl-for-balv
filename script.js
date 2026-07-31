@@ -187,15 +187,29 @@ function updateHeartbeat() {
 }
 
 // Watchdog-Funktion zur Deadlock-Erkennung
+let lastWatchdogTick = Date.now();
+
 function startWatchdog() {
     if (watchdogTimer) clearInterval(watchdogTimer);
-    
+    lastWatchdogTick = Date.now();
+
     watchdogTimer = setInterval(async () => {
         if (isShuttingDown) return;
 
         const now = Date.now();
         const timeSinceLastHeartbeat = now - lastHeartbeat;
-        
+
+        // Standby-Erkennung: Konnte der Watchdog-Timer selbst lange nicht laufen,
+        // war der ganze Prozess eingefroren (Rechner-Standby/App Nap) - das ist
+        // kein Deadlock. Heartbeat zurücksetzen statt Browser-Restart erzwingen.
+        const sinceLastTick = now - lastWatchdogTick;
+        lastWatchdogTick = now;
+        if (sinceLastTick > WATCHDOG_INTERVAL * 3) {
+            logger.warn(`WATCHDOG: Prozess war ~${Math.round(sinceLastTick / 1000)}s eingefroren (Standby?) - Heartbeat zurückgesetzt, kein Restart`);
+            updateHeartbeat();
+            return;
+        }
+
         // CPU-Auslastung vom Script selbst berechnen
         const currentCpuUsage = process.cpuUsage(lastCpuUsage);
         const elapseMs = now - lastCpuCheck;
@@ -498,7 +512,7 @@ async function validateSession() {
 
 // Verbessertes Keep-Alive mit Fehlerbehandlung
 async function keepSessionAlive() {
-    if (!page || page.isClosed() || isShuttingDown) return;
+    if (!page || page.isClosed() || isShuttingDown || restartInProgress) return;
 
     // Nur eingeloggte Sessions am Leben halten - ein Reload während des Logins
     // bricht sonst das Warten auf die Login-Antwort ab
@@ -555,7 +569,25 @@ async function closeBrowserSafely() {
 }
 
 // Browser-Neustart Funktion
+// Mutex: Watchdog, Keep-Alive-Fehlerpfad und main() können gleichzeitig einen
+// Restart anstoßen - zwei parallele Firefox-Starts auf demselben Profil führen
+// zu "A copy of Firefox is already open" und erzwingen sonst den Shutdown
+let restartInProgress = false;
+
 async function restartBrowser() {
+    if (restartInProgress) {
+        logger.info("Browser-Neustart läuft bereits, überspringe doppelten Restart");
+        return;
+    }
+    restartInProgress = true;
+    try {
+        await doRestartBrowser();
+    } finally {
+        restartInProgress = false;
+    }
+}
+
+async function doRestartBrowser() {
     logger.info("Browser wird neu gestartet...");
 
     try {
@@ -784,6 +816,10 @@ async function performLogin() {
 // Verbesserte Hauptfunktion mit Circuit Breaker
 async function main() {
     if (isShuttingDown) return 0;
+    if (restartInProgress) {
+        logger.info("Browser-Neustart läuft, überspringe diesen Durchlauf");
+        return 0;
+    }
 
     let datenVolumen = 0.0;
 
